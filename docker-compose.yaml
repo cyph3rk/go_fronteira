@@ -1,0 +1,34 @@
+services:
+  go-env:
+    build: .
+    container_name: ambiente-go
+    volumes:
+      - .:/app
+    restart: always
+
+  upstream:
+    build: .
+    working_dir: /app
+    volumes:
+      - .:/app
+    environment:
+      - LISTEN_ADDR=:8081
+    command: ["sh", "-lc", "go run ./cmd/example-server"]
+
+  gateway:
+    build: .
+    working_dir: /app
+    volumes:
+      - .:/app
+    ports:
+      - "8080:8080"
+    environment:
+      - LISTEN_ADDR=:8080
+      - UPSTREAM_URL=http://upstream:8081
+      - RATE_ENABLED=true
+      - RATE_RPS=10
+      - RATE_BURST=20
+      - CONCURRENCY_MAX=100
+    command: ["sh", "-lc", "go run ./cmd/gateway"]
+    depends_on:
+      - upstream
