@@ -1,15 +1,38 @@
 package ratelimit
 
 import (
+	"context"
 	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
+	"middleware-gateway/middleware/ratelimit/domain"
 	"middleware-gateway/middleware/ratelimit/infra"
 )
+
+type fakeStatsStore struct {
+	mu     sync.Mutex
+	events []domain.StatsEvent
+}
+
+func (f *fakeStatsStore) Record(_ context.Context, ev domain.StatsEvent) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.events = append(f.events, ev)
+	return nil
+}
+
+func (f *fakeStatsStore) Events() []domain.StatsEvent {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	out := make([]domain.StatsEvent, len(f.events))
+	copy(out, f.events)
+	return out
+}
 
 func TestMiddleware_AllowsThenRejectsSameKey(t *testing.T) {
 	store := infra.NewStore(0.02, 1)
@@ -126,5 +149,52 @@ func TestMiddleware_RetryAfterUsesSeconds(t *testing.T) {
 	if got := strings.TrimSpace(w2.Header().Get("Retry-After")); got != "2" {
 		// int(2.5s.Seconds()) == 2
 		t.Fatalf("expected Retry-After=2, got %q", got)
+	}
+}
+
+func TestMiddleware_RecordsStatsAllowedAndDenied(t *testing.T) {
+	store := infra.NewStore(0.02, 1)
+	stats := &fakeStatsStore{}
+
+	next := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	})
+
+	h := Middleware(Options{
+		Store:      store,
+		Stats:      stats,
+		RetryAfter: 1 * time.Second,
+	})(next)
+
+	// 1) allow
+	r1 := httptest.NewRequest(http.MethodGet, "http://example/showTela", nil)
+	r1.RemoteAddr = "10.0.0.1:1234"
+	w1 := httptest.NewRecorder()
+	h.ServeHTTP(w1, r1)
+	if w1.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d", w1.Code)
+	}
+
+	// 2) deny
+	r2 := httptest.NewRequest(http.MethodGet, "http://example/showTela", nil)
+	r2.RemoteAddr = "10.0.0.1:1234"
+	w2 := httptest.NewRecorder()
+	h.ServeHTTP(w2, r2)
+	if w2.Code != http.StatusTooManyRequests {
+		t.Fatalf("expected 429, got %d", w2.Code)
+	}
+
+	evs := stats.Events()
+	if len(evs) != 2 {
+		t.Fatalf("expected 2 stats events, got %d", len(evs))
+	}
+	if evs[0].Allowed != true {
+		t.Fatalf("expected first event Allowed=true, got %v", evs[0].Allowed)
+	}
+	if evs[1].Allowed != false {
+		t.Fatalf("expected second event Allowed=false, got %v", evs[1].Allowed)
+	}
+	if evs[0].Method != http.MethodGet || evs[0].Path != "/showTela" {
+		t.Fatalf("expected method/path GET /showTela, got %q %q", evs[0].Method, evs[0].Path)
 	}
 }

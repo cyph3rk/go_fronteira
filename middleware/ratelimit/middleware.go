@@ -14,6 +14,7 @@ type KeyFunc func(r *http.Request) string
 
 type Options struct {
 	Store               domain.LimiterStore
+	Stats               domain.StatsStore
 	KeyFn               KeyFunc
 	KeyHeader           string
 	TrustXForwardedFor  bool
@@ -89,6 +90,15 @@ func Middleware(opts Options) func(next http.Handler) http.Handler {
 			}
 
 			dec := svc.Decide(domain.Key(key))
+			if opts.Stats != nil {
+				_ = opts.Stats.Record(r.Context(), domain.StatsEvent{
+					Key:     domain.Key(key),
+					Allowed: dec.Allowed,
+					Method:  r.Method,
+					Path:    r.URL.Path,
+					At:      time.Now(),
+				})
+			}
 			if !dec.Allowed {
 				w.Header().Set("Retry-After", formatInt(int(dec.RetryAfter.Seconds())))
 				http.Error(w, http.StatusText(opts.RejectStatus), opts.RejectStatus)

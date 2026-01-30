@@ -1,34 +1,39 @@
 services:
-  go-env:
-    build: .
-    container_name: ambiente-go
-    volumes:
-      - .:/app
-    restart: always
+  redis:
+    image: redis:7-alpine
+    command: ["redis-server", "--appendonly", "no"]
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
 
   upstream:
-    build: .
-    working_dir: /app
-    volumes:
-      - .:/app
+    build:
+      context: .
+      target: build-upstream
     environment:
       - LISTEN_ADDR=:8081
-    command: ["sh", "-lc", "go run ./cmd/example-server"]
+    command: ["./upstream"]
 
   gateway:
-    build: .
-    working_dir: /app
-    volumes:
-      - .:/app
+    build:
+      context: .
+      target: build-gateway
     ports:
       - "8080:8080"
     environment:
       - LISTEN_ADDR=:8080
       - UPSTREAM_URL=http://upstream:8081
       - RATE_ENABLED=true
-      - RATE_RPS=10
-      - RATE_BURST=20
+      - RATE_RPS=2
+      - RATE_BURST=5
+      - RATE_STATS_ENABLED=true
+      - RATE_STATS_REDIS_ADDR=redis:6379
       - CONCURRENCY_MAX=100
-    command: ["sh", "-lc", "go run ./cmd/gateway"]
+    command: ["./gateway"]
     depends_on:
-      - upstream
+      redis:
+        condition: service_healthy
+      upstream:
+        condition: service_started

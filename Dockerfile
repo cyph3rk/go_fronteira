@@ -1,17 +1,20 @@
-FROM golang:1.25-alpine AS build 
-
+FROM golang:1.23-alpine AS build 
 WORKDIR /app
-RUN apk add --no-cache git
-COPY . .
+COPY go.mod go.sum ./
 RUN go mod download
-RUN CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -o /go_fronteira
+COPY . .
 
-FROM scratch
-WORKDIR /
-COPY --from=build /go_fronteira .
+# Alvo para o Gateway
+FROM build AS build-gateway
+RUN CGO_ENABLED=0 GOOS=linux go build -o /app/bin/gateway ./cmd/gateway
 
-RUN chmod +x /go_fronteira
+# Alvo para o Upstream
+FROM build AS build-upstream
+RUN CGO_ENABLED=0 GOOS=linux go build -o /app/bin/upstream ./cmd/example-server
 
-EXPOSE 8080
-
-ENTRYPOINT ["./go_fronteira"]
+# Imagem Final (Leve)
+FROM alpine:latest
+WORKDIR /app
+COPY --from=build-gateway /app/bin/gateway .
+COPY --from=build-upstream /app/bin/upstream .
+# Alpine precisa de permissão se você for rodar scripts, mas binários Go rodam direto

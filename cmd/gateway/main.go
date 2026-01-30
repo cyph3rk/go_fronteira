@@ -10,11 +10,15 @@ import (
 	"os"
 	"os/signal"
 	"strconv"
+	"strings"
 	"syscall"
 	"time"
 
 	"middleware-gateway/middleware/ratelimit"
+	"middleware-gateway/middleware/ratelimit/domain"
 	"middleware-gateway/middleware/ratelimit/infra"
+
+	"github.com/redis/go-redis/v9"
 )
 
 func main() {
@@ -36,6 +40,31 @@ func main() {
 
 	store := infra.NewStore(cfg.rateRPS, cfg.rateBurst)
 
+	var statsStore domain.StatsStore
+	if cfg.rateStatsEnabled {
+		rdb := redis.NewClient(&redis.Options{
+			Addr:     cfg.rateStatsRedisAddr,
+			Password: cfg.rateStatsRedisPassword,
+			DB:       cfg.rateStatsRedisDB,
+		})
+		defer func() { _ = rdb.Close() }()
+
+		pingCtx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		_, err := rdb.Ping(pingCtx).Result()
+		cancel()
+		if err != nil {
+			log.Fatalf("redis stats ping error: %v", err)
+		}
+
+		statsStore = infra.NewRedisStatsStore(
+			rdb,
+			infra.WithStatsPrefix(cfg.rateStatsPrefix),
+			infra.WithStatsTTL(cfg.rateStatsTTL),
+			infra.WithStatsBucket(cfg.rateStatsBucket),
+			infra.WithStatsTrackKeys(cfg.rateStatsTrackKeys),
+		)
+	}
+
 	ctx, cancel := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer cancel()
 	store.StartJanitor(ctx)
@@ -49,6 +78,7 @@ func main() {
 	if cfg.rateEnabled {
 		h = ratelimit.Middleware(ratelimit.Options{
 			Store:               store,
+			Stats:               statsStore,
 			KeyHeader:           cfg.rateKeyHeader,
 			TrustXForwardedFor:  cfg.trustXFF,
 			RejectStatus:        http.StatusTooManyRequests,
@@ -75,6 +105,7 @@ func main() {
 
 	log.Printf("gateway listening on %s -> %s", cfg.listenAddr, target)
 	log.Printf("rate: enabled=%v rps=%.3f burst=%d keyHeader=%q trustXFF=%v", cfg.rateEnabled, cfg.rateRPS, cfg.rateBurst, cfg.rateKeyHeader, cfg.trustXFF)
+	log.Printf("rate-stats: enabled=%v redisAddr=%q bucket=%q ttl=%s trackKeys=%v", cfg.rateStatsEnabled, cfg.rateStatsRedisAddr, cfg.rateStatsBucket, cfg.rateStatsTTL, cfg.rateStatsTrackKeys)
 	log.Printf("concurrency: max=%d acquireTimeout=%s", cfg.concurrencyMax, cfg.concurrencyTimeout)
 
 	if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
@@ -94,6 +125,15 @@ type config struct {
 	addHeaders         bool
 	concurrencyMax     int
 	concurrencyTimeout time.Duration
+
+	rateStatsEnabled       bool
+	rateStatsRedisAddr     string
+	rateStatsRedisPassword string
+	rateStatsRedisDB       int
+	rateStatsPrefix        string
+	rateStatsTTL           time.Duration
+	rateStatsBucket        string
+	rateStatsTrackKeys     bool
 }
 
 func readConfig() (config, error) {
@@ -120,6 +160,19 @@ func readConfig() (config, error) {
 	cfg.concurrencyMax = getenvIntDefault("CONCURRENCY_MAX", 100)
 	cfg.concurrencyTimeout = getenvDurationDefault("CONCURRENCY_TIMEOUT", 0)
 
+	cfg.rateStatsEnabled = getenvBoolDefault("RATE_STATS_ENABLED", false)
+	cfg.rateStatsRedisAddr = getenvDefault("RATE_STATS_REDIS_ADDR", "")
+	cfg.rateStatsRedisPassword = os.Getenv("RATE_STATS_REDIS_PASSWORD")
+	cfg.rateStatsRedisDB = getenvIntDefault("RATE_STATS_REDIS_DB", 0)
+	cfg.rateStatsPrefix = getenvDefault("RATE_STATS_PREFIX", "ratelimit:stats")
+	cfg.rateStatsTTL = getenvDurationDefault("RATE_STATS_TTL", 24*time.Hour)
+	cfg.rateStatsBucket = getenvDefault("RATE_STATS_BUCKET", "minute")
+	cfg.rateStatsTrackKeys = getenvBoolDefault("RATE_STATS_TRACK_KEYS", false)
+
+	if cfg.rateStatsEnabled && strings.TrimSpace(cfg.rateStatsRedisAddr) == "" {
+		return config{}, errors.New("RATE_STATS_REDIS_ADDR is required when RATE_STATS_ENABLED=true")
+	}
+
 	if cfg.upstreamURL == "" {
 		return config{}, errors.New("UPSTREAM_URL is required")
 	}
@@ -134,7 +187,6 @@ func readConfig() (config, error) {
 	}
 	return cfg, nil
 }
-
 func stringsRequired(k string) string { return os.Getenv(k) }
 
 func getenvDefault(k, def string) string {
